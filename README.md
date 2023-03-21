@@ -1,2 +1,2 @@
 # cache-redis
-infra.go default cache driver.
+infra.Go default cache driver.
