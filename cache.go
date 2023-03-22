@@ -29,9 +29,8 @@ type (
 		mutex   sync.RWMutex
 		actives int64
 
-		name    string
-		config  cache.Config
-		setting redisSetting
+		instance *cache.Instance
+		setting  redisSetting
 
 		client *redis.Pool
 	}
@@ -48,34 +47,34 @@ type (
 )
 
 // 连接
-func (driver *redisDriver) Connect(name string, config cache.Config) (cache.Connect, error) {
+func (driver *redisDriver) Connect(inst *cache.Instance) (cache.Connect, error) {
 	setting := redisSetting{
 		Server: "127.0.0.1:6379", Password: "", Database: "",
 		Idle: 30, Active: 100, Timeout: 240,
 	}
 
-	if vv, ok := config.Setting["server"].(string); ok && vv != "" {
+	if vv, ok := inst.Setting["server"].(string); ok && vv != "" {
 		setting.Server = vv
 	}
-	if vv, ok := config.Setting["password"].(string); ok && vv != "" {
+	if vv, ok := inst.Setting["password"].(string); ok && vv != "" {
 		setting.Password = vv
 	}
 
 	//数据库，redis的0-16号
-	if v, ok := config.Setting["database"].(string); ok {
+	if v, ok := inst.Setting["database"].(string); ok {
 		setting.Database = v
 	}
 
-	if vv, ok := config.Setting["idle"].(int64); ok && vv > 0 {
+	if vv, ok := inst.Setting["idle"].(int64); ok && vv > 0 {
 		setting.Idle = int(vv)
 	}
-	if vv, ok := config.Setting["active"].(int64); ok && vv > 0 {
+	if vv, ok := inst.Setting["active"].(int64); ok && vv > 0 {
 		setting.Active = int(vv)
 	}
-	if vv, ok := config.Setting["timeout"].(int64); ok && vv > 0 {
+	if vv, ok := inst.Setting["timeout"].(int64); ok && vv > 0 {
 		setting.Timeout = time.Second * time.Duration(vv)
 	}
-	if vv, ok := config.Setting["timeout"].(string); ok && vv != "" {
+	if vv, ok := inst.Setting["timeout"].(string); ok && vv != "" {
 		td, err := util.ParseDuration(vv)
 		if err == nil {
 			setting.Timeout = td
@@ -83,7 +82,7 @@ func (driver *redisDriver) Connect(name string, config cache.Config) (cache.Conn
 	}
 
 	return &redisConnect{
-		name: name, config: config, setting: setting,
+		instance: inst, setting: setting,
 	}, nil
 }
 
