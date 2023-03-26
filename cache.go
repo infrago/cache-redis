@@ -144,7 +144,7 @@ func (this *redisConnect) Close() error {
 	return nil
 }
 
-func (this *redisConnect) Serial(key string, start, step int64, expiry time.Duration) (int64, error) {
+func (this *redisConnect) Sequence(key string, start, step int64, expiry time.Duration) (int64, error) {
 	//加并发锁，忘记之前为什么加了，应该是有问题加了才正常的
 	// this.mutex.Lock()
 	// defer this.mutex.Unlock()
