@@ -38,7 +38,7 @@ type (
 		Server   string //服务器地址，ip:端口
 		Password string //服务器auth密码
 		Database string //数据库
-		Expiry   time.Duration
+		Expire   time.Duration
 
 		Idle    int //最大空闲连接
 		Active  int //最大激活连接，同时最大并发
@@ -144,7 +144,7 @@ func (this *redisConnect) Close() error {
 	return nil
 }
 
-func (this *redisConnect) Sequence(key string, start, step int64, expiry time.Duration) (int64, error) {
+func (this *redisConnect) Sequence(key string, start, step int64, expire time.Duration) (int64, error) {
 	//加并发锁，忘记之前为什么加了，应该是有问题加了才正常的
 	// this.mutex.Lock()
 	// defer this.mutex.Unlock()
@@ -167,7 +167,7 @@ func (this *redisConnect) Sequence(key string, start, step int64, expiry time.Du
 
 	//写入值
 	data := []byte(fmt.Sprintf("%v", value))
-	err := this.Write(key, data, expiry)
+	err := this.Write(key, data, expire)
 	if err != nil {
 		log.Warning("cache.redis.serial", err)
 		return int64(0), err
@@ -220,7 +220,7 @@ func (this *redisConnect) Read(key string) ([]byte, error) {
 }
 
 // 更新缓存
-func (this *redisConnect) Write(key string, data []byte, expiry time.Duration) error {
+func (this *redisConnect) Write(key string, data []byte, expire time.Duration) error {
 	if this.client == nil {
 		return errInvalidCacheConnection
 	}
@@ -236,8 +236,8 @@ func (this *redisConnect) Write(key string, data []byte, expiry time.Duration) e
 	args := []Any{
 		key, value,
 	}
-	if expiry > 0 {
-		args = append(args, "EX", expiry.Seconds())
+	if expire > 0 {
+		args = append(args, "EX", expire.Seconds())
 	}
 
 	_, err := conn.Do("SET", args...)
