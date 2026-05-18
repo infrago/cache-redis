@@ -2,20 +2,48 @@ package cache_redis
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/infrago/infra"
 	"github.com/infrago/cache"
+	"github.com/infrago/infra"
 	"github.com/redis/go-redis/v9"
 )
 
 type redisDriver struct{}
 
 type redisConnection struct {
-	client *redis.Client
+	client  *redis.Client
+	timeout time.Duration
+	unlink  bool
 }
+
+const sequenceManyScript = `
+local count = tonumber(ARGV[4])
+if count <= 0 then
+	return {}
+end
+local current
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	current = tonumber(ARGV[1])
+else
+	current = tonumber(redis.call("GET", KEYS[1])) + tonumber(ARGV[2])
+end
+local vals = {}
+for i = 1, count do
+	if i > 1 then
+		current = current + tonumber(ARGV[2])
+	end
+	vals[i] = current
+end
+redis.call("SET", KEYS[1], current)
+if tonumber(ARGV[3]) > 0 then
+	redis.call("PEXPIRE", KEYS[1], ARGV[3])
+end
+return vals
+`
 
 func init() {
 	infra.Register("redis", &redisDriver{})
@@ -31,6 +59,14 @@ func (d *redisDriver) Connect(inst *cache.Instance) (cache.Connect, error) {
 	}
 	username, _ := inst.Config.Setting["username"].(string)
 	password, _ := inst.Config.Setting["password"].(string)
+	timeout := 3 * time.Second
+	if v, ok := durationSetting(inst.Config.Setting["timeout"]); ok && v > 0 {
+		timeout = v
+	}
+	unlink := false
+	if v, ok := boolSetting(inst.Config.Setting["unlink"]); ok {
+		unlink = v
+	}
 
 	db := 0
 	if v, ok := inst.Config.Setting["database"].(int); ok {
@@ -50,14 +86,20 @@ func (d *redisDriver) Connect(inst *cache.Instance) (cache.Connect, error) {
 		DB:       db,
 	})
 
-	return &redisConnection{client: client}, nil
+	return &redisConnection{client: client, timeout: timeout, unlink: unlink}, nil
 }
 
-func (c *redisConnection) Open() error  { return nil }
+func (c *redisConnection) Open() error {
+	ctx, cancel := c.context()
+	defer cancel()
+	return c.client.Ping(ctx).Err()
+}
 func (c *redisConnection) Close() error { return c.client.Close() }
 
 func (c *redisConnection) Read(key string) ([]byte, error) {
-	val, err := c.client.Get(context.Background(), key).Bytes()
+	ctx, cancel := c.context()
+	defer cancel()
+	val, err := c.client.Get(ctx, key).Bytes()
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -65,35 +107,70 @@ func (c *redisConnection) Read(key string) ([]byte, error) {
 }
 
 func (c *redisConnection) Write(key string, val []byte, expire time.Duration) error {
-	return c.client.Set(context.Background(), key, val, expire).Err()
+	ctx, cancel := c.context()
+	defer cancel()
+	return c.client.Set(ctx, key, val, expire).Err()
 }
 
 func (c *redisConnection) Exists(key string) (bool, error) {
-	cnt, err := c.client.Exists(context.Background(), key).Result()
+	ctx, cancel := c.context()
+	defer cancel()
+	cnt, err := c.client.Exists(ctx, key).Result()
 	return cnt > 0, err
 }
 
 func (c *redisConnection) Delete(key string) error {
-	return c.client.Del(context.Background(), key).Err()
+	ctx, cancel := c.context()
+	defer cancel()
+	return c.client.Del(ctx, key).Err()
 }
 
 func (c *redisConnection) Sequence(key string, start, step int64, expire time.Duration) (int64, error) {
-	val, err := c.client.IncrBy(context.Background(), key, step).Result()
+	vals, err := c.SequenceMany(key, start, step, 1, expire)
 	if err != nil {
 		return -1, err
 	}
-	if val == step {
-		if start != 0 {
-			val = start
-			_ = c.client.Set(context.Background(), key, val, expire).Err()
-		} else if expire > 0 {
-			_ = c.client.Expire(context.Background(), key, expire).Err()
+	if len(vals) == 0 {
+		return -1, nil
+	}
+	return vals[0], nil
+}
+
+func (c *redisConnection) SequenceMany(key string, start, step, count int64, expire time.Duration) ([]int64, error) {
+	if count <= 0 {
+		return []int64{}, nil
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	val, err := c.client.Eval(
+		ctx, sequenceManyScript, []string{key},
+		start, step, expire.Milliseconds(), count,
+	).Slice()
+	if err != nil {
+		return nil, err
+	}
+	vals := make([]int64, 0, len(val))
+	for _, item := range val {
+		switch v := item.(type) {
+		case int64:
+			vals = append(vals, v)
+		case int:
+			vals = append(vals, int64(v))
+		case string:
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, n)
+		default:
+			n, err := strconv.ParseInt(fmt.Sprintf("%v", v), 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, n)
 		}
 	}
-	if expire > 0 {
-		_ = c.client.Expire(context.Background(), key, expire).Err()
-	}
-	return val, nil
+	return vals, nil
 }
 
 func (c *redisConnection) Keys(prefix string) ([]string, error) {
@@ -102,16 +179,105 @@ func (c *redisConnection) Keys(prefix string) ([]string, error) {
 	} else if !strings.HasSuffix(prefix, "*") {
 		prefix = prefix + "*"
 	}
-	return c.client.Keys(context.Background(), prefix).Result()
+	ctx, cancel := c.context()
+	defer cancel()
+	iter := c.client.Scan(ctx, 0, prefix, 1000).Iterator()
+	keys := make([]string, 0)
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	return keys, iter.Err()
 }
 
 func (c *redisConnection) Clear(prefix string) error {
-	keys, err := c.Keys(prefix)
-	if err != nil {
+	if prefix == "" {
+		prefix = "*"
+	} else if !strings.HasSuffix(prefix, "*") {
+		prefix = prefix + "*"
+	}
+	ctx, cancel := c.context()
+	defer cancel()
+	iter := c.client.Scan(ctx, 0, prefix, 1000).Iterator()
+	keys := make([]string, 0, 1000)
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+		if len(keys) >= 1000 {
+			if err := c.deleteKeys(ctx, keys); err != nil {
+				return err
+			}
+			keys = keys[:0]
+		}
+	}
+	if err := iter.Err(); err != nil {
 		return err
 	}
+	if len(keys) > 0 {
+		return c.deleteKeys(ctx, keys)
+	}
+	return nil
+}
+
+func (c *redisConnection) context() (context.Context, context.CancelFunc) {
+	if c.timeout <= 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), c.timeout)
+}
+
+func (c *redisConnection) deleteKeys(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}
-	return c.client.Del(context.Background(), keys...).Err()
+	if c.unlink {
+		return c.client.Unlink(ctx, keys...).Err()
+	}
+	return c.client.Del(ctx, keys...).Err()
+}
+
+func durationSetting(v any) (time.Duration, bool) {
+	switch vv := v.(type) {
+	case time.Duration:
+		return vv, true
+	case int:
+		return time.Duration(vv) * time.Second, true
+	case int64:
+		return time.Duration(vv) * time.Second, true
+	case float64:
+		return time.Duration(vv * float64(time.Second)), true
+	case string:
+		text := strings.TrimSpace(vv)
+		d, err := time.ParseDuration(text)
+		if err != nil {
+			n, parseErr := strconv.ParseFloat(text, 64)
+			if parseErr != nil {
+				return 0, false
+			}
+			return time.Duration(n * float64(time.Second)), true
+		}
+		return d, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func boolSetting(v any) (bool, bool) {
+	switch vv := v.(type) {
+	case bool:
+		return vv, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(vv)) {
+		case "true", "1", "yes", "on":
+			return true, true
+		case "false", "0", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	case int:
+		return vv != 0, true
+	case int64:
+		return vv != 0, true
+	default:
+		return false, false
+	}
 }
