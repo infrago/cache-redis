@@ -69,14 +69,8 @@ func (d *redisDriver) Connect(inst *cache.Instance) (cache.Connect, error) {
 	}
 
 	db := 0
-	if v, ok := inst.Config.Setting["database"].(int); ok {
+	if v, ok := intSetting(inst.Config.Setting["database"]); ok {
 		db = v
-	} else if v, ok := inst.Config.Setting["database"].(int64); ok {
-		db = int(v)
-	} else if v, ok := inst.Config.Setting["database"].(string); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			db = n
-		}
 	}
 
 	client := redis.NewClient(&redis.Options{
@@ -174,33 +168,30 @@ func (c *redisConnection) SequenceMany(key string, start, step, count int64, exp
 }
 
 func (c *redisConnection) Keys(prefix string) ([]string, error) {
-	if prefix == "" {
-		prefix = "*"
-	} else if !strings.HasSuffix(prefix, "*") {
-		prefix = prefix + "*"
-	}
 	ctx, cancel := c.context()
 	defer cancel()
-	iter := c.client.Scan(ctx, 0, prefix, 1000).Iterator()
+	iter := c.client.Scan(ctx, 0, redisScanPattern(prefix), 1000).Iterator()
 	keys := make([]string, 0)
 	for iter.Next(ctx) {
-		keys = append(keys, iter.Val())
+		key := iter.Val()
+		if prefix == "" || strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
 	}
 	return keys, iter.Err()
 }
 
 func (c *redisConnection) Clear(prefix string) error {
-	if prefix == "" {
-		prefix = "*"
-	} else if !strings.HasSuffix(prefix, "*") {
-		prefix = prefix + "*"
-	}
 	ctx, cancel := c.context()
 	defer cancel()
-	iter := c.client.Scan(ctx, 0, prefix, 1000).Iterator()
+	iter := c.client.Scan(ctx, 0, redisScanPattern(prefix), 1000).Iterator()
 	keys := make([]string, 0, 1000)
 	for iter.Next(ctx) {
-		keys = append(keys, iter.Val())
+		key := iter.Val()
+		if prefix != "" && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		keys = append(keys, key)
 		if len(keys) >= 1000 {
 			if err := c.deleteKeys(ctx, keys); err != nil {
 				return err
@@ -232,6 +223,57 @@ func (c *redisConnection) deleteKeys(ctx context.Context, keys []string) error {
 		return c.client.Unlink(ctx, keys...).Err()
 	}
 	return c.client.Del(ctx, keys...).Err()
+}
+
+func redisScanPattern(prefix string) string {
+	if prefix == "" {
+		return "*"
+	}
+	var b strings.Builder
+	b.Grow(len(prefix) + 1)
+	for _, r := range prefix {
+		switch r {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('*')
+	return b.String()
+}
+
+func intSetting(v any) (int, bool) {
+	switch vv := v.(type) {
+	case int:
+		return vv, true
+	case int8:
+		return int(vv), true
+	case int16:
+		return int(vv), true
+	case int32:
+		return int(vv), true
+	case int64:
+		return int(vv), true
+	case uint:
+		return int(vv), true
+	case uint8:
+		return int(vv), true
+	case uint16:
+		return int(vv), true
+	case uint32:
+		return int(vv), true
+	case uint64:
+		return int(vv), true
+	case float32:
+		return int(vv), true
+	case float64:
+		return int(vv), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(vv))
+		return n, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func durationSetting(v any) (time.Duration, bool) {
